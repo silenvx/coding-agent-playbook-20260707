@@ -36,7 +36,7 @@ app/
 | 言語 / ランタイム | TypeScript + Bun | 全パッケージ共通。トランスパイル設定なしで TS を直接実行 |
 | ワークスペース | Bun Workspaces | パッケージ数が少なく依存グラフも単純なため、turborepo 等は導入しない |
 | `web` | React + Vite（SPA） | S3 + CloudFront の静的配信と整合 |
-| `api` / `mock` | Hono | tRPC の公式 Hono adapter で `api` を実装。`mock` は素の REST |
+| `api` / `mock` | Hono | `@hono/trpc-server`（Hono 向け tRPC 統合ミドルウェア）で `api` を実装。`mock` は素の REST |
 | `web` ⇔ `api` 型共有 | tRPC | コード生成不要。`api` の router 型をそのまま `web` が import |
 | `api` ⇔ `mock` 通信 | REST（JSON over HTTP） | `mock` は本物の外部 API を模す位置づけのため、内部専用の tRPC で結合しない |
 | 外部連携アダプタ境界 | Port/Adapter パターン | `core` に Port（interface）を定義。詳細は 5 章 |
@@ -46,7 +46,7 @@ app/
 | Lint / Format | Biome | |
 | CI | GitHub Actions | |
 | IaC | AWS CDK（TypeScript） | `infra/` workspace |
-| データ永続化 | なし（MVPスコープ） | 4 章参照 |
+| データ永続化 | なし（MVPスコープ） | 6 章参照 |
 
 ## 4. アーキテクチャ / データフロー
 
@@ -87,7 +87,7 @@ sequenceDiagram
   U->>W: OTP入力
   W->>A: verifyOtp mutation
   A->>M: POST /sms/verify-otp
-  A-->>W: JWT発行 (httpOnly cookie)
+  A-->>W: JWT発行 (HttpOnly cookie)
   U->>W: データ提供に同意
   W->>A: submitConsent mutation
   A->>M: GET /power-data/smart-meter, /power-data/contract (PowerDataClient Port)
@@ -108,18 +108,23 @@ sequenceDiagram
 // packages/core/src/ports/power-data-client.ts
 export interface PowerDataClient {
   getSmartMeterReadings(contractId: string, period: DateRange): Promise<SmartMeterReading[]>;
+  // ContractInfo は契約電力・契約名義に加え、現行プランの料金体系 (PricingPlan) を含む
+  // (calculateBacktest が要求する currentPlan の出所はここ。7章参照)
   getContractInfo(contractId: string): Promise<ContractInfo>;
 }
 
 // packages/core/src/ports/sms-client.ts
 export interface SmsClient {
   sendOtp(phoneNumber: string): Promise<{ requestId: string }>;
-  verifyOtp(requestId: string, code: string): Promise<{ verified: boolean }>;
+  // 検証済みの主体識別子 (phoneNumber) を戻り値に含める。呼び出し側が
+  // client 入力の電話番号を信用せず、この戻り値だけで JWT を発行できるようにするため
+  verifyOtp(requestId: string, code: string): Promise<{ verified: boolean; phoneNumber: string }>;
 }
 
 // packages/core/src/ports/jepx-client.ts
 export interface JepxClient {
-  getMonthlyPrices(period: DateRange): Promise<MonthlyPrice[]>;
+  // 30分値単位（タイムスタンプ付き）で返す。月次集計は core 側 (calculateBacktest) で行う
+  getMarketPrices(period: DateRange): Promise<MarketPrice[]>;
 }
 ```
 
@@ -141,14 +146,14 @@ export class MockPowerDataClient implements PowerDataClient {
 |---|---|
 | `GET /power-data/smart-meter` | 30分値のサンプルデータ |
 | `GET /power-data/contract` | 契約情報（契約電力・契約名義等）のサンプルデータ |
-| `POST /sms/send-otp` / `POST /sms/verify-otp` | SMS認証のシミュレーション |
-| `GET /jepx/price` | 過去12ヶ月分の市場価格サンプルデータ |
+| `POST /sms/send-otp` / `POST /sms/verify-otp` | SMS認証のシミュレーション（`verify-otp` は検証済み電話番号を含めて返す） |
+| `GET /jepx/price` | 過去12ヶ月分・30分値単位の市場価格サンプルデータ |
 
 ## 6. 認証・セッション設計
 
 診断フローは会員登録のない単発フローのため、永続的なユーザーアカウントは持たない。
 
-1. `SmsClient` Port 経由で OTP 発行・検証を行う（MVP では `mock` がシミュレート）
+1. `SmsClient` Port 経由で OTP 発行・検証を行う（MVP では `mock` が固定コードでシミュレート）。本番接続時は `SmsClient` の本番 Adapter に OTP 有効期限・再送制限・検証試行回数の上限（lockout）を実装する（MVP スコープ外）
 2. OTP検証成功後、`api` が本人確認済みの電話番号（主体識別子）を紐づけた短命 JWT（有効期限 15 分程度）を発行し、cookie に `HttpOnly; Secure; SameSite=Lax` 属性で設定する
 3. 以降の診断フロー（データ取得・料金計算）の tRPC 呼び出しは、tRPC の `context` でこの JWT を検証する軽量セッションとして扱う。**`PowerDataClient` 等の Port 呼び出しに使う識別子（`contractId` 等）は client から渡させず、この JWT に紐づく主体識別子からサーバー側で解決する**（5章参照）。MVP では `mock` サービスが固定のサンプル契約（`contractId` 固定値）のみ返すため、電話番号→契約IDのマッピング機構自体が不要（`api` は JWT 検証後、この固定値で Port を呼び出す）。本番接続では、協会側の同意フローで本人確認情報から契約IDを解決する仕組みが必要になる（本番 Adapter の責務、MVP範囲外）
 4. 診断結果は `web` 側の state で保持し、申込フォーム遷移時にそのまま契約情報をプレフィルする（サーバー側に永続化しない）
@@ -161,23 +166,24 @@ export class MockPowerDataClient implements PowerDataClient {
 ```typescript
 // packages/core/src/domain/backtest.ts
 export function calculateBacktest(
-  readings: SmartMeterReading[],
-  currentPlan: PricingPlan,
-  marketPrices: MonthlyPrice[],
+  readings: SmartMeterReading[],  // 30分値
+  currentPlan: PricingPlan,       // getContractInfo が返す現行プランの料金体系
+  marketPrices: MarketPrice[],    // 30分値単位の市場価格（JepxClient.getMarketPrices）
 ): MonthlyComparison[] { /* ... */ }
 ```
+
+30分値の消費量と同じ時間粒度で市場価格を掛け合わせてから月次集計する（月次価格に潰すと、消費が特定の時間帯に偏るユーザーで料金を誤算する）。
 
 `apps/api` の tRPC ルーターはこの関数を呼び出すだけの薄い層に留める。これにより `core` は「ドメイン型 + Port定義 + ドメインロジック」を持つ一貫した責務になり、Vitest でのユニットテストも tRPC/Hono の起動なしに書ける。
 
 ## 8. AWS構成
 
 - 単一環境（dev/stg/prod のような環境分割は MVP スコープ外。one-pager に記載なく、必要になれば追加する）
-- `web`: S3（静的ホスティング）+ CloudFront（CDN配信、HTTPS終端）。SPA のクライアントサイドルーティングに対応するため、CloudFront のカスタムエラーレスポンス（403/404 → 200、レスポンスパス `/index.html`）で URL 直アクセス・リロード時の S3 403/404 をフォールバックする
+- `web`: S3（private bucket + OAC、パブリックアクセスは禁止し CloudFront からのみ許可）+ CloudFront（CDN配信、HTTPS終端）。SPA のクライアントサイドルーティングに対応するため、CloudFront のカスタムエラーレスポンス（403/404 → 200、レスポンスパス `/index.html`）で URL 直アクセス・リロード時の S3 403/404 をフォールバックする
 - `api` / `mock`: ECS Fargate（Private Subnet）+ ALB（Public Subnet）
-- CloudFront はパスパターン（`/api/*` → ALB、それ以外 → S3）でオリジンを分岐し、`web`/`api` を同一オリジンにまとめる
-- 証明書は ACM（CloudFront 用は us-east-1、ALB 用はデプロイ先リージョン）
-- 独自ドメイン（Route53）は one-pager に記載がなく MVP スコープ外。CloudFront のデフォルトドメイン（`*.cloudfront.net`）で運用する
-- `infra/` の CDK app が上記一式（VPC・ECS・ALB・S3・CloudFront・ACM）を定義する
+- CloudFront はパスパターン（`/api/*` → ALB、それ以外 → S3）でオリジンを分岐し、`web`/`api` を同一オリジンにまとめる。`/api/*` ビヘイビアは全 HTTP メソッド許可・キャッシュ無効化・cookie と `Origin` / `Sec-Fetch-Site` ヘッダの転送を明示する（CloudFront/CDK の既定は GET/HEAD のみ許可・キャッシュ有効化のため、明示しないと tRPC の mutation や認証ヘッダが ALB まで届かない）
+- CloudFront のデフォルトドメイン（`*.cloudfront.net`）で運用するため、CloudFront 用の ACM 証明書は不要（デフォルト証明書を使用）。独自ドメイン（Route53）導入時に ACM 証明書（us-east-1）を追加する（MVP スコープ外）
+- `infra/` の CDK app が上記一式（VPC・ECS・ALB・S3・CloudFront）を定義する
 
 ## 9. CI/CD
 
