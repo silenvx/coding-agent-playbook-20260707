@@ -108,8 +108,8 @@ sequenceDiagram
 // packages/core/src/ports/power-data-client.ts
 export interface PowerDataClient {
   getSmartMeterReadings(contractId: string, period: DateRange): Promise<SmartMeterReading[]>;
-  // ContractInfo は契約電力・契約名義に加え、現行プランの料金体系 (PricingPlan) を含む
-  // (calculateBacktest が要求する currentPlan の出所はここ。7章参照)
+  // ContractInfo は契約電力・契約名義等（one-pager の取得対象）のみを含む。
+  // 現行プランの料金体系 (PricingPlan) は協会データの取得範囲外のため含めない (7章参照)
   getContractInfo(contractId: string): Promise<ContractInfo>;
 }
 
@@ -167,12 +167,14 @@ export class MockPowerDataClient implements PowerDataClient {
 // packages/core/src/domain/backtest.ts
 export function calculateBacktest(
   readings: SmartMeterReading[],  // 30分値
-  currentPlan: PricingPlan,       // getContractInfo が返す現行プランの料金体系
+  currentPlan: PricingPlan,       // 現行プランの料金体系。出所は下記参照
   marketPrices: MarketPrice[],    // 30分値単位の市場価格（JepxClient.getMarketPrices）
 ): MonthlyComparison[] { /* ... */ }
 ```
 
 30分値の消費量と同じ時間粒度で市場価格を掛け合わせてから月次集計する（月次価格に潰すと、消費が特定の時間帯に偏るユーザーで料金を誤算する）。
+
+`currentPlan`（現行プランの料金体系）は協会データ（`PowerDataClient.getContractInfo`）の取得範囲外（契約電力・契約名義のみ）のため、別途解決する。MVP では `core` が固定の代表プラン（サンプルデータ）を提供する。本番接続では、ユーザーにプラン選択を入力させるか、別途料金プラン提供元（`PricingPlanProvider` 等）を設計する（MVP範囲外）。
 
 `apps/api` の tRPC ルーターはこの関数を呼び出すだけの薄い層に留める。これにより `core` は「ドメイン型 + Port定義 + ドメインロジック」を持つ一貫した責務になり、Vitest でのユニットテストも tRPC/Hono の起動なしに書ける。
 
