@@ -1,6 +1,6 @@
 export function DoneStep() {
   return (
-    <div className="done">
+    <div className="done-panel">
       <div className="done-check" aria-hidden>
         ✓
       </div>
