@@ -150,9 +150,9 @@ export class MockPowerDataClient implements PowerDataClient {
 
 1. `SmsClient` Port 経由で OTP 発行・検証を行う（MVP では `mock` がシミュレート）
 2. OTP検証成功後、`api` が本人確認済みの電話番号（主体識別子）を紐づけた短命 JWT（有効期限 15 分程度）を発行し、cookie に `HttpOnly; Secure; SameSite=Lax` 属性で設定する
-3. 以降の診断フロー（データ取得・料金計算）の tRPC 呼び出しは、tRPC の `context` でこの JWT を検証する軽量セッションとして扱う。**`PowerDataClient` 等の Port 呼び出しに使う識別子（`contractId` 等）は client から渡させず、この JWT に紐づく主体識別子からサーバー側で解決する**（5章参照）
+3. 以降の診断フロー（データ取得・料金計算）の tRPC 呼び出しは、tRPC の `context` でこの JWT を検証する軽量セッションとして扱う。**`PowerDataClient` 等の Port 呼び出しに使う識別子（`contractId` 等）は client から渡させず、この JWT に紐づく主体識別子からサーバー側で解決する**（5章参照）。MVP では `mock` サービスが固定のサンプル契約（`contractId` 固定値）のみ返すため、電話番号→契約IDのマッピング機構自体が不要（`api` は JWT 検証後、この固定値で Port を呼び出す）。本番接続では、協会側の同意フローで本人確認情報から契約IDを解決する仕組みが必要になる（本番 Adapter の責務、MVP範囲外）
 4. 診断結果は `web` 側の state で保持し、申込フォーム遷移時にそのまま契約情報をプレフィルする（サーバー側に永続化しない）
-5. cookie 認証の状態変更系 mutation（`sendOtp` / `verifyOtp` / `submitConsent`）は CSRF 対策として `Origin` / `Sec-Fetch-Site` ヘッダ検証を行う（同一オリジン構成で CORS 設定は不要になるが、CSRF 境界は別途必要）
+5. cookie 認証の状態変更系 mutation（`verifyOtp` / `submitConsent`）は CSRF 対策として `Origin` / `Sec-Fetch-Site` ヘッダ検証を行う（同一オリジン構成で CORS 設定は不要になるが、CSRF 境界は別途必要。`sendOtp` は JWT cookie 発行前のため対象外）
 
 ## 7. バックテスト計算ロジック（`packages/core`）
 
@@ -172,7 +172,7 @@ export function calculateBacktest(
 ## 8. AWS構成
 
 - 単一環境（dev/stg/prod のような環境分割は MVP スコープ外。one-pager に記載なく、必要になれば追加する）
-- `web`: S3（静的ホスティング）+ CloudFront（CDN配信、HTTPS終端）
+- `web`: S3（静的ホスティング）+ CloudFront（CDN配信、HTTPS終端）。SPA のクライアントサイドルーティングに対応するため、CloudFront のカスタムエラーレスポンス（403/404 → 200、レスポンスパス `/index.html`）で URL 直アクセス・リロード時の S3 403/404 をフォールバックする
 - `api` / `mock`: ECS Fargate（Private Subnet）+ ALB（Public Subnet）
 - CloudFront はパスパターン（`/api/*` → ALB、それ以外 → S3）でオリジンを分岐し、`web`/`api` を同一オリジンにまとめる
 - 証明書は ACM（CloudFront 用は us-east-1、ALB 用はデプロイ先リージョン）
